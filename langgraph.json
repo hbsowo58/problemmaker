@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "quiz": "./make_graph.py:graph"
+  },
+  "env": ".env"
+}

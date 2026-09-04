@@ -1,0 +1,17 @@
+# 환경변수 (API 키)
+.env
+.env.local
+
+# 파이썬
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 벡터 DB / 캐시
+chroma_db/
+.langgraph_api/
+
+# OS
+.DS_Store
+Thumbs.db
