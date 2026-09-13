@@ -9,6 +9,9 @@ import hashlib
 import io
 from typing import Dict, List
 
+import fitz
+import numpy as np
+from PIL import Image
 from langchain_core.documents import Document
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_openai import OpenAIEmbeddings
@@ -26,6 +29,7 @@ CHUNK_OVERLAP = 150
 
 # doc_id -> 색인 결과. 그래프 노드는 상태에 담긴 doc_id로 여기서 검색기를 꺼내 쓴다.
 _INDEXES: Dict[str, dict] = {}
+_OCR_READER = None
 
 
 def make_doc_id(pdf_bytes: bytes) -> str:
@@ -45,10 +49,38 @@ def load_pdf(pdf_bytes: bytes) -> List[Document]:
         docs.append(Document(page_content=text, metadata={"page": page_num}))
 
     if not docs:
+        return load_scanned_pdf_with_ocr(pdf_bytes)
+
+    return docs
+
+
+def load_scanned_pdf_with_ocr(pdf_bytes: bytes) -> List[Document]:
+    """텍스트가 없는 스캔 PDF를 페이지별 EasyOCR 텍스트로 변환"""
+    global _OCR_READER
+
+    try:
+        import easyocr
+    except ImportError as error:
         raise ValueError(
-            "PDF에서 텍스트를 추출하지 못했습니다. "
-            "스캔 이미지 PDF인 경우 OCR을 거친 파일이 필요합니다."
-        )
+            "스캔 PDF를 읽으려면 먼저 `pip install -r requirements.txt`를 실행하세요."
+        ) from error
+
+    if _OCR_READER is None:
+        _OCR_READER = easyocr.Reader(["ko", "en"], gpu=False)
+
+    pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
+    docs = []
+
+    for page_num, page in enumerate(pdf, start=1):
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        image = Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
+        lines = _OCR_READER.readtext(np.array(image), detail=0, paragraph=True)
+        text = "\n".join(line.strip() for line in lines if line.strip())
+        if text:
+            docs.append(Document(page_content=text, metadata={"page": page_num}))
+
+    if not docs:
+        raise ValueError("스캔 PDF에서 글자를 인식하지 못했습니다.")
 
     return docs
 
