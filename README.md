@@ -66,7 +66,9 @@ START → planning → supervisor ─┬→ mcq   ─┐
 | 파일 | 내용 | 참고한 챕터 |
 |---|---|---|
 | `app.py` | Streamlit UI (업로드 / 옵션 / 진행 상황 / 결과 탭 / 내보내기) | PART2 `app.py` |
-| `retriever.py` | PDF → 페이지 분해 → 청킹 → 벡터 색인 → 검색 | CHAP6 `rag_agent/retriever.py` |
+| `retriever.py` | PDF → 페이지 분해(+OCR 폴백) → 청킹 → 벡터 색인 → 검색 | CHAP6 `rag_agent/retriever.py` |
+| `ocr_server.py` | 스캔 PDF OCR MCP 서버 (stdio) — `pdf_probe`, `pdf_ocr` 도구 | CHAP9 `mcp_agent/server.py` |
+| `ocr_client.py` | OCR MCP 서버를 호출하는 동기 클라이언트 | CHAP9 `mcp_agent/client.py` |
 | `state.py` | `MessagesState` 확장 상태 | CHAP6 `rag_agent/state.py`, CHAP7 `settings.py` |
 | `schemas.py` | `QuizPlan`, `MCQ`, `ShortAnswer`, `Essay`, `Grade` | CHAP6 `edges.py`, CHAP7 `planning_agent.py` |
 | `settings.py` | 모델 팩토리와 시스템 프롬프트 | CHAP7 `settings.py` |
@@ -98,9 +100,52 @@ START → planning → supervisor ─┬→ mcq   ─┐
 - **이어서 더 만들기**: 같은 `thread_id`로 다시 실행하면 체크포인트에 남아 있던 기존 문항을 읽어, 부족분만 생성하고 프롬프트에 "이미 출제된 문항(중복 금지)"으로 넣어 준다. 단기 메모리가 실제로 결과를 바꾸는 지점.
 - 사이드바 **세션 초기화**는 `checkpointer.delete_thread(thread_id)` — CHAP8 "체크포인트 관리" 절 그대로.
 
+## 스캔 PDF OCR (CHAP9 MCP 패턴)
+
+텍스트 레이어가 없는 페이지는 OCR을 거쳐 색인된다. OCR 기능은 별도 MCP 서버로 분리돼 있다.
+
+```
+app.py → retriever.build_index
+           └─ extract_text_layer (pypdf)        # 페이지별 텍스트 확인
+              └─ 빈 페이지가 있으면
+                 ocr_client.ocr_pdf             # stdio MCP 클라이언트
+                   └─ ocr_server.py (자식 프로세스)
+                        pdf_probe  : 텍스트 레이어 유무 조사
+                        pdf_ocr    : PyMuPDF 렌더링 → gpt-4o 비전 전사
+```
+
+| 항목 | 값 |
+|---|---|
+| 엔진 | PyMuPDF 렌더링 + `gpt-4o` 비전 (`OCR_MODEL` 환경 변수로 교체 가능) |
+| 별도 설치 | 없음 — Tesseract/poppler 불필요, 기존 `OPENAI_API_KEY` 재사용 |
+| 해상도 | 200 DPI (`ocr_server.RENDER_DPI`) |
+| 동시 호출 | 4 (`MAX_CONCURRENCY`) |
+| 한도 | 한 번에 40페이지 (`MAX_OCR_PAGES`) — 비용 안전장치 |
+| 비용 | 페이지당 gpt-4o 비전 1회. 스캔 10페이지 ≈ $0.1 내외 |
+
+화면에는 OCR로 읽은 페이지 수가 지표로 뜨고, 어떤 페이지였는지 캡션으로 표시된다.
+
+**구현하면서 걸렸던 것**
+
+- **stdout은 프로토콜 채널이다.** stdio MCP에서 서버의 stdout은 JSON-RPC 전용이다. PyMuPDF는 경고를 **기본적으로 stdout에 찍기 때문에**(폰트 인코딩 미지원, xref 손상 등 특정 PDF에서만 발생) 그대로 두면 응답 줄에 경고가 달라붙어 세션이 끊긴다. 증상은 `unhandled errors in a TaskGroup (1 sub-exception)` — 원인이 전혀 드러나지 않는다.
+  ```
+  input_value='MuPDF error: bad font{"jsonrpc":"2.0",...}'
+                                    ↑ 응답이 경고 뒤에 붙어 파싱 실패
+  ```
+  `import pymupdf` **전에** `PYMUPDF_MESSAGE=fd:2`를 설정하고, `set_messages(fd=2)` + `TOOLS.mupdf_display_errors(False)`로 이중 차단한다 (`ocr_server.py` 상단). PDF에 따라 성공/실패가 갈린다면 이걸 의심할 것.
+- Windows에서 stdio MCP 서버는 자식 프로세스로 뜬다. `WindowsSelectorEventLoopPolicy`를 쓰면 `subprocess`를 지원하지 않아 서버가 뜨지 않는다 → **Proactor 루프**를 쓴다 (`ocr_client.py`).
+- **anyio의 `ExceptionGroup`은 원인을 감춘다.** `describe_error()`로 하위 예외를 풀어내고, 서버 stderr를 `ocr_server.log`로 받아 에러 메시지에 함께 붙인다.
+- `stdio_client`의 기본 환경은 안전한 최소 집합이라 `OPENAI_API_KEY`가 서버까지 가지 않는다 → `StdioServerParameters(env=dict(os.environ))`로 현재 환경을 넘긴다.
+- `mcp` 2.x는 `FastMCP`가 `MCPServer`로 바뀌어 CHAP9 코드와 호환되지 않는다 → `mcp>=1.19,<2`로 고정.
+- 서버는 `sys.executable`로 띄운다. `"python"`으로 쓰면 가상환경 밖 인터프리터가 잡혀 import 에러가 난다.
+
+**한계**
+
+- PDF가 텍스트 레이어를 갖고 있지만 인코딩이 깨져 글자가 뭉개지는 경우(예: `/UniKS-UTF16-H`)는 "텍스트가 있다"고 판정돼 OCR이 돌지 않는다. 이런 파일은 강제로 OCR을 태워야 한다.
+
 ## 알아두면 좋은 점
 
-- **스캔 이미지 PDF는 안 된다.** `pypdf`가 텍스트를 못 뽑으면 명시적으로 에러를 낸다. OCR을 거친 PDF가 필요하다.
+- **스캔 이미지 PDF도 읽는다.** `pypdf`가 텍스트를 못 뽑은 페이지만 골라 OCR MCP 서버로 넘긴다(아래 "스캔 PDF OCR" 참고). 텍스트 페이지와 스캔 페이지가 섞여 있어도 스캔 페이지에만 OCR이 돈다.
 - **벡터스토어는 인메모리다.** 프로세스가 죽으면 색인이 사라진다. CHAP6처럼 영속화하려면 `retriever.build_index`의 `InMemoryVectorStore`를 `Chroma(persist_directory=...)`로 바꾸면 된다(나머지 코드는 그대로).
 - **비용**: 출제는 문서 색인(임베딩) 1회 + planning 1회 + 유형당 생성 1회 + 문항당 검증 1회(gpt-4o-mini). 채점은 주관식 1문항당 gpt-4o-mini 1회, 서술형 1문항당 gpt-4o 1회(객관식은 0회). 10문항 기준 출제 4~5회 + 채점 5회 정도.
 - `langgraph.json`이 있으므로 `langgraph dev`로도 띄울 수 있다.

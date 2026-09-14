@@ -15,3 +15,6 @@ chroma_db/
 # OS
 .DS_Store
 Thumbs.db
+
+# OCR MCP 서버 로그
+ocr_server.log

@@ -163,21 +163,44 @@ if uploaded is not None:
     if not retriever_module.has_index(doc_id):
         if not api_key:
             st.stop()
-        with st.spinner("PDF를 읽고 색인하는 중…"):
-            try:
-                doc_id = retriever_module.build_index(pdf_bytes, uploaded.name)
-            except ValueError as error:
-                st.error(str(error))
-                st.stop()
+
+        status = st.status("PDF를 읽고 색인하는 중…", expanded=False)
+
+        def on_ocr_progress(done: int, total: int) -> None:
+            """텍스트 레이어가 없는 페이지를 OCR하는 동안 진행률을 보여준다"""
+            status.update(
+                label=f"스캔본으로 보입니다 — OCR 진행 중… ({done}/{total} 페이지)"
+            )
+
+        try:
+            doc_id = retriever_module.build_index(
+                pdf_bytes, uploaded.name, progress=on_ocr_progress
+            )
+        except ValueError as error:
+            status.update(label="색인 실패", state="error")
+            st.error(str(error))
+            st.stop()
+
+        status.update(label="색인 완료", state="complete")
 
     st.session_state.doc_id = doc_id
     st.session_state.doc_name = uploaded.name
 
     stats = retriever_module.get_stats(doc_id)
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("파일", stats["name"][:24])
     col2.metric("페이지 수", stats["page_count"])
     col3.metric("색인 청크 수", stats["chunk_count"])
+    col4.metric("OCR 페이지", stats["ocr_page_count"])
+
+    if stats["ocr_page_count"]:
+        pages_label = ", ".join(f"p.{p}" for p in stats["ocr_pages"][:12])
+        if stats["ocr_page_count"] > 12:
+            pages_label += " …"
+        st.caption(
+            f"🔍 텍스트 레이어가 없어 OCR로 읽은 페이지: {pages_label} "
+            "— 인식 오류가 섞일 수 있으니 문항의 원문 인용을 한 번 확인해주세요."
+        )
 
 
 # =====================================================================
